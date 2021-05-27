@@ -41,8 +41,8 @@ def rotate_image(image, angle):
   image_center = tuple(np.array(image.shape[1::-1]) / 2)
   rot_mat = cv2.getRotationMatrix2D(image_center, angle, 1.0)
   result = cv2.warpAffine(image, rot_mat, image.shape[1::-1] , flags=cv2.INTER_LINEAR) #image.shape[1::-1]
-  print('image.shape',image.shape)
-  print('image.shape[1::-1]',image.shape[1::-1])
+  #print('image.shape',image.shape)
+  #print('image.shape[1::-1]',image.shape[1::-1])
   return result
 
 # Get orientation exif tag

@@ -1,10 +1,14 @@
 import argparse
 import time
 from pathlib import Path
+import numpy as np
+import copy
 
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
+
+from utils.hm_detect import HeatMap
 
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
@@ -13,9 +17,23 @@ from utils.general import check_img_size, check_requirements, check_imshow, non_
 from utils.plots import colors, plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_synchronized
 
+from lc_logic import Line_cross, InferenceLC
+
+from deep_sort_pytorch.deep_sort import build_tracker
+from deep_sort_pytorch.utils.draw import draw_boxes
+from deep_sort_pytorch.utils.parser import get_config
 
 @torch.no_grad()
 def detect(opt):
+
+    #-----Line crossing variables------------
+    pos_lc  = ((52,35),(52,239))
+    pos_lc1 = ((375,40),(375,290))
+    pos_lc2 = ((350,40),(350,290))
+    pos_lc3 = ((117,35),(117,239))
+    pos_lc4 = ((268,35),(268,239))
+    #----------------------------------------
+
     source, weights, view_img, save_txt, imgsz = opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size
     save_img = not opt.nosave and not source.endswith('.txt')  # save inference images
     webcam = source.isnumeric() or source.endswith('.txt') or source.lower().startswith(
@@ -51,13 +69,34 @@ def detect(opt):
         cudnn.benchmark = True  # set True to speed up constant image size inference
         dataset = LoadStreams(source, img_size=imgsz, stride=stride)
     else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride)
+        dataset =LoadImages(source, img_size=imgsz, stride=stride)
 
     # Run inference
     if device.type != 'cpu':
         model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
     t0 = time.time()
+
+    cfg = get_config()
+    cfg.merge_from_file("./deep_sort_pytorch/configs/yolov3.yaml")
+    cfg.merge_from_file("./deep_sort_pytorch/configs/deep_sort.yaml")
+    deepsort_person = build_tracker(cfg, use_cuda=1)
+
+
+    #--------Call to line crossing Class---------------
+    lc = Line_cross(pos_lc)
+    lc1 = Line_cross(pos_lc1)
+    lc2 = Line_cross(pos_lc2)
+    lc3 = Line_cross(pos_lc3)
+    lc4 = Line_cross(pos_lc4)
+    #---------------------------------------------------
+
+    inf_lcs = InferenceLC([lc, lc1, lc2, lc3, lc4])
+    idx = 0
     for path, img, im0s, vid_cap in dataset:
+        if idx == 0 and opt.hm == True:
+            print(f'----------Shape of im0s: {im0s.shape}')
+            hm = HeatMap(im0s)
+            
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -77,8 +116,9 @@ def detect(opt):
         if classify:
             pred = apply_classifier(pred, modelc, img, im0s)
 
-        # Process detections
         for i, det in enumerate(pred):  # detections per image
+
+
             if webcam:  # batch_size >= 1
                 p, s, im0, frame = path[i], f'{i}: ', im0s[i].copy(), dataset.count
             else:
@@ -90,19 +130,41 @@ def detect(opt):
             s += '%gx%g ' % img.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if opt.save_crop else im0  # for opt.save_crop
+
+            inf_lcs.draw_lcs(im0)
+
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+                
+                bbox_results = det.detach().cpu().numpy()
+         
+                hm.create_image(bbox_results[:,:4])
+                hm.acumulate()
+                #hm = hm.get_hm()#####
+                bbox_results = inf_lcs.xyxy2xywh(bbox_results)
+                
+                # Tracker update
+                outputs_person = deepsort_person.update(
+                            bbox_results[:,:4], bbox_results[:,4], im0)
+
+                if len(outputs_person) > 0:
+                        im0 = inf_lcs.draw_tracker(outputs_person, im0)
+                        center_point = inf_lcs.get_centers()
+                        inf_lcs.draw_circles(center_point, im0)   
+                        inf_lcs.track_directions(center_point)               
 
                 # Print results
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
+                
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                        
                         line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # label format
                         with open(txt_path + '.txt', 'a') as f:
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
@@ -110,7 +172,8 @@ def detect(opt):
                     if save_img or opt.save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
                         label = None if opt.hide_labels else (names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
-                        plot_one_box(xyxy, im0, label=label, color=colors(c, True), line_thickness=opt.line_thickness)
+                        
+                        # Se incluye bloque para generar heat map a partir de los bbox detectados
                         if opt.save_crop:
                             save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
@@ -133,15 +196,19 @@ def detect(opt):
                             vid_writer.release()  # release previous video writer
                         if vid_cap:  # video
                             fps = vid_cap.get(cv2.CAP_PROP_FPS)                
-                            # w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            # h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                             w=640
                             h=360
                         else:  # stream
                             fps, w, h = 30, im0.shape[1], im0.shape[0]
                             save_path += '.mp4'
                         vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+
+                    inf_lcs.count_lcs()
+                    inf_lcs.draw_count_results(im0)
                     vid_writer.write(im0)
+        idx+=1
+    hm = hm.get_hm(idx) # /idx
+    cv2.imwrite("./stuff/heat_map.jpg",hm)
 
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
@@ -152,7 +219,7 @@ def detect(opt):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
+    parser.add_argument('--weights', nargs='+', type=str, default='yolov5x.pt', help='model.pt path(s)')
     parser.add_argument('--source', type=str, default='data/images', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
@@ -174,10 +241,11 @@ if __name__ == '__main__':
     parser.add_argument('--line-thickness', default=3, type=int, help='bounding box thickness (pixels)')
     parser.add_argument('--hide-labels', default=False, action='store_true', help='hide labels')
     parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
+    parser.add_argument('--hm', default=False, type=bool, help='generate heat map')
     opt = parser.parse_args()
     print(opt)
     check_requirements(exclude=('tensorboard', 'pycocotools', 'thop'))
-
+    
     if opt.update:  # update all models (to fix SourceChangeWarning)
         for opt.weights in ['yolov5s.pt', 'yolov5m.pt', 'yolov5l.pt', 'yolov5x.pt']:
             detect(opt=opt)
